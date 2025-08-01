@@ -80,30 +80,7 @@ var (
 	smtpPort     string
 	smtpUser     string
 	smtpPassword string
-	// frontendURL is no longer needed as the reset URL is generated dynamically
 )
-
-const emailTemplate = `
-<!DOCTYPE html>
-<html>
-<head>
-<style>
-    body { font-family: Arial, sans-serif; }
-    .container { padding: 20px; }
-    .button { background-color: #4CAF50; color: white; padding: 14px 20px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 12px; }
-</style>
-</head>
-<body>
-<div class="container">
-    <h2>Password Reset Request</h2>
-    <p>You are receiving this email because a password reset request was made for your account.</p>
-    <p>Please click the button below to reset your password. This link will expire in 1 hour.</p>
-    <a href="{{.URL}}" class="button">Reset Password</a>
-    <p>If you did not request a password reset, please ignore this email.</p>
-</div>
-</body>
-</html>
-`
 
 func loadTemplate(path string) (string, error) {
 	data, err := os.ReadFile(path)
@@ -190,7 +167,6 @@ func loadConfig() {
 	smtpPort = os.Getenv("SMTP_PORT")
 	smtpUser = os.Getenv("SMTP_USER")
 	smtpPassword = os.Getenv("SMTP_PASSWORD")
-	// frontendURL is no longer needed as the reset URL is generated dynamically
 }
 
 // --- MIDDLEWARE ---
@@ -400,18 +376,14 @@ func createTodo(c *gin.Context) {
 	todo.ID = primitive.NewObjectID()
 	todo.CreatedAt = time.Now()
 	todo.UpdatedAt = time.Now()
-	todo.Status = "Pending"
-	todo.CompletionPercentage = 0
 
-	if len(todo.ChecklistItems) > 0 {
-		completedCount := 0
-		for _, item := range todo.ChecklistItems {
-			if item.Completed {
-				completedCount++
-			}
-		}
-		todo.CompletionPercentage = (float64(completedCount) / float64(len(todo.ChecklistItems))) * 100
+	// Default status if not provided or invalid
+	if todo.Status == "" {
+		todo.Status = "Pending"
 	}
+
+	// Calculate completion percentage and update status based on checklist items
+	todo.CompletionPercentage, todo.Status = calculateCompletionAndStatus(todo.ChecklistItems, todo.Status)
 
 	collection := client.Database("todoapp").Collection("todos")
 	_, err := collection.InsertOne(context.TODO(), todo)
@@ -427,6 +399,7 @@ func getTodos(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 	filter := bson.M{"user_id": userID}
 
+	// Date Filter
 	dateFilter := c.Query("filter")
 	now := time.Now()
 	var startDate, endDate time.Time
@@ -467,7 +440,29 @@ func getTodos(c *gin.Context) {
 	}
 
 	if !startDate.IsZero() && !endDate.IsZero() {
-		filter["due_date"] = bson.M{"$gte": startDate, "$lt": endDate}
+		filter["created_at"] = bson.M{"$gte": startDate, "$lt": endDate}
+	}
+
+	// Priority Filter
+	priorityFilter := c.Query("priority")
+	if priorityFilter != "" && priorityFilter != "all" {
+		filter["priority"] = priorityFilter
+	}
+
+	// Status Filter
+	statusFilter := c.Query("status")
+	if statusFilter != "" && statusFilter != "all" {
+		filter["status"] = statusFilter
+	}
+
+	// Keyword Search
+	keyword := c.Query("keyword")
+	if keyword != "" {
+		// Case-insensitive search on Title and Description
+		filter["$or"] = []bson.M{
+			{"title": bson.M{"$regex": primitive.Regex{Pattern: keyword, Options: "i"}}},
+			{"description": bson.M{"$regex": primitive.Regex{Pattern: keyword, Options: "i"}}},
+		}
 	}
 
 	collection := client.Database("todoapp").Collection("todos")
@@ -525,40 +520,43 @@ func updateTodo(c *gin.Context) {
 		return
 	}
 
-	// Calculate completion percentage based on checklist items
-	if len(todoUpdate.ChecklistItems) > 0 {
-		completedCount := 0
-		for _, item := range todoUpdate.ChecklistItems {
-			if item.Completed {
-				completedCount++
-			}
-		}
-		todoUpdate.CompletionPercentage = (float64(completedCount) / float64(len(todoUpdate.ChecklistItems))) * 100
-	} else {
-		// If no checklist items, base completion on task status
-		if todoUpdate.Status == "Completed" {
-			todoUpdate.CompletionPercentage = 100
-		} else {
-			todoUpdate.CompletionPercentage = 0
-		}
+	collection := client.Database("todoapp").Collection("todos")
+	var existingTodo Todo
+	err = collection.FindOne(context.TODO(), bson.M{"_id": objID, "user_id": userID}).Decode(&existingTodo)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Todo not found"})
+		return
 	}
+
+	// Apply incoming updates to existing todo
+	existingTodo.Title = todoUpdate.Title
+	existingTodo.Description = todoUpdate.Description
+	existingTodo.Priority = todoUpdate.Priority
+	existingTodo.DueDate = todoUpdate.DueDate
+	existingTodo.NotesOnCompletion = todoUpdate.NotesOnCompletion
+	existingTodo.NotesOnNonCompletion = todoUpdate.NotesOnNonCompletion
+	existingTodo.ChecklistItems = todoUpdate.ChecklistItems // Update checklist items directly
+
+	// Handle status and completion percentage based on checklist items or manual status
+	if todoUpdate.Status == "Completed" {
+		// If task is manually set to completed, mark all checklist items as completed
+		for i := range existingTodo.ChecklistItems {
+			existingTodo.ChecklistItems[i].Completed = true
+			existingTodo.ChecklistItems[i].InProgress = false
+		}
+		existingTodo.Status = "Completed"
+		existingTodo.CompletionPercentage = 100
+	} else {
+		// Otherwise, calculate status and percentage based on checklist items
+		existingTodo.CompletionPercentage, existingTodo.Status = calculateCompletionAndStatus(existingTodo.ChecklistItems, existingTodo.Status)
+	}
+
+	existingTodo.UpdatedAt = time.Now()
 
 	update := bson.M{
-		"$set": bson.M{
-			"title":                   todoUpdate.Title,
-			"description":             todoUpdate.Description,
-			"priority":                todoUpdate.Priority,
-			"due_date":                todoUpdate.DueDate,
-			"status":                  todoUpdate.Status,
-			"completion_percentage":   todoUpdate.CompletionPercentage,
-			"notes_on_completion":     todoUpdate.NotesOnCompletion,
-			"notes_on_non_completion": todoUpdate.NotesOnNonCompletion,
-			"checklist_items":         todoUpdate.ChecklistItems,
-			"updated_at":              time.Now(),
-		},
+		"$set": existingTodo, // Set the entire updated struct
 	}
 
-	collection := client.Database("todoapp").Collection("todos")
 	result, err := collection.UpdateOne(context.TODO(), bson.M{"_id": objID, "user_id": userID}, update)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update todo"})
@@ -598,24 +596,40 @@ func updateTodoStatus(c *gin.Context) {
 		return
 	}
 
-	completionPercentage := todo.CompletionPercentage
-	if payload.Status == "Completed" {
-		completionPercentage = 100
-	} else if payload.Status == "In Progress" {
-		// If setting task to In Progress, and it has checklist items, don't force 0%
-		// Otherwise, if no checklist, set to 0% if it was completed before.
-		if len(todo.ChecklistItems) == 0 && todo.Status == "Completed" {
-			completionPercentage = 0
+	// Apply new status
+	todo.Status = payload.Status
+
+	// Adjust checklist items and completion percentage based on new status
+	if todo.Status == "Completed" {
+		for i := range todo.ChecklistItems {
+			todo.ChecklistItems[i].Completed = true
+			todo.ChecklistItems[i].InProgress = false
 		}
-	} else if payload.Status == "Pending" {
-		completionPercentage = 0
+		todo.CompletionPercentage = 100
+	} else {
+		// If status is changed from Completed to something else, reset checklist items
+		// and recalculate based on their current state.
+		// If it was manually set to In Progress or Pending, we don't force checklist changes.
+		if len(todo.ChecklistItems) > 0 && payload.Status != "Completed" {
+			// If task was completed and now is not, uncheck all checklist items
+			if todo.Status == "Completed" { // This check is against the *new* status, which is not "Completed"
+				for i := range todo.ChecklistItems {
+					todo.ChecklistItems[i].Completed = false
+					todo.ChecklistItems[i].InProgress = false
+				}
+			}
+		}
+		todo.CompletionPercentage, _ = calculateCompletionAndStatus(todo.ChecklistItems, todo.Status) // Recalculate based on current checklist state
 	}
+
+	todo.UpdatedAt = time.Now()
 
 	update := bson.M{
 		"$set": bson.M{
-			"status":                payload.Status,
-			"completion_percentage": completionPercentage,
-			"updated_at":            time.Now(),
+			"status":                todo.Status,
+			"completion_percentage": todo.CompletionPercentage,
+			"checklist_items":       todo.ChecklistItems, // Ensure checklist items are saved
+			"updated_at":            todo.UpdatedAt,
 		},
 	}
 
@@ -699,7 +713,7 @@ func getAnalytics(c *gin.Context) {
 		endDate = endDate.Add(24 * time.Hour)
 	}
 
-	if !startDate.IsZero() && !endDate.IsZero() {
+	if filterPeriod != "all" && !startDate.IsZero() {
 		filter["created_at"] = bson.M{"$gte": startDate, "$lt": endDate}
 	}
 
@@ -819,6 +833,43 @@ func exportAnalytics(c *gin.Context) {
 }
 
 // --- HELPERS ---
+
+// calculateCompletionAndStatus determines the completion percentage and status based on checklist items.
+// It takes the current checklist items and the existing status as input.
+// It returns the calculated completion percentage and the new status.
+func calculateCompletionAndStatus(checklist []ChecklistItem, currentStatus string) (float64, string) {
+	if len(checklist) == 0 {
+		// If no checklist items, status is determined by currentStatus (e.g., manually set)
+		if currentStatus == "Completed" {
+			return 100, "Completed"
+		}
+		return 0, currentStatus // Maintain current status if no checklist
+	}
+
+	completedCount := 0
+	inProgressCount := 0
+	for _, item := range checklist {
+		if item.Completed {
+			completedCount++
+		}
+		if item.InProgress && !item.Completed { // An item can be in progress but not yet completed
+			inProgressCount++
+		}
+	}
+
+	percentage := (float64(completedCount) / float64(len(checklist))) * 100
+
+	newStatus := "Pending"
+	if completedCount == len(checklist) {
+		newStatus = "Completed"
+	} else if inProgressCount > 0 || completedCount > 0 {
+		// If at least one item is in progress, or some are completed but not all
+		newStatus = "In Progress"
+	}
+
+	return percentage, newStatus
+}
+
 func sendEmail(to, subject, bodyTemplate string, data map[string]string) error {
 	if smtpHost == "" {
 		log.Println("SMTP not configured, skipping email send.")
