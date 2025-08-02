@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/smtp"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/cloudinary/cloudinary-go/v2"
+	"github.com/cloudinary/cloudinary-go/v2/api/uploader"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -58,8 +61,39 @@ type User struct {
 	ID                primitive.ObjectID `json:"id,omitempty" bson:"_id,omitempty"`
 	Email             string             `json:"email,omitempty" bson:"email,omitempty"`
 	Password          string             `json:"password,omitempty" bson:"password,omitempty"`
+	FirstName         string             `json:"first_name,omitempty" bson:"first_name,omitempty"`
+	LastName          string             `json:"last_name,omitempty" bson:"last_name,omitempty"`
+	ProfilePictureURL string             `json:"profile_picture_url,omitempty" bson:"profile_picture_url,omitempty"`
+	CreatedAt         time.Time          `json:"created_at,omitempty" bson:"created_at,omitempty"`
+	UpdatedAt         time.Time          `json:"updated_at,omitempty" bson:"updated_at,omitempty"`
 	ResetToken        string             `json:"-" bson:"reset_token,omitempty"`
 	ResetTokenExpires time.Time          `json:"-" bson:"reset_token_expires,omitempty"`
+}
+
+// Resource represents a learning resource
+type Resource struct {
+	Name string `json:"name,omitempty" bson:"name,omitempty"`
+	URL  string `json:"url,omitempty" bson:"url,omitempty"`
+}
+
+// Learning represents a single learning goal/entry
+type Learning struct {
+	ID              primitive.ObjectID `json:"id,omitempty" bson:"_id,omitempty"`
+	UserID          primitive.ObjectID `json:"user_id,omitempty" bson:"user_id,omitempty"`
+	Title           string             `json:"title,omitempty" bson:"title,omitempty"`
+	Category        string             `json:"category,omitempty" bson:"category,omitempty"` // e.g., "Programming", "Design", "Language", "Skill"
+	Status          string             `json:"status,omitempty" bson:"status,omitempty"`     // "Planned", "In Progress", "Completed", "Dropped"
+	StartDate       time.Time          `json:"start_date,omitempty" bson:"start_date,omitempty"`
+	CompletionDate  *time.Time         `json:"completion_date,omitempty" bson:"completion_date,omitempty"` // Nullable
+	Resources       []Resource         `json:"resources,omitempty" bson:"resources,omitempty"`
+	Notes           string             `json:"notes,omitempty" bson:"notes,omitempty"`
+	Progress        float64            `json:"progress,omitempty" bson:"progress,omitempty"`                 // 0-100%
+	Impact          string             `json:"impact,omitempty" bson:"impact,omitempty"`                     // How this learning helped
+	KeyMilestones   []string           `json:"key_milestones,omitempty" bson:"key_milestones,omitempty"`     // New field for learning
+	ChallengesFaced string             `json:"challenges_faced,omitempty" bson:"challenges_faced,omitempty"` // New field for learning
+	NextSteps       string             `json:"next_steps,omitempty" bson:"next_steps,omitempty"`             // New field for learning
+	CreatedAt       time.Time          `json:"created_at,omitempty" bson:"created_at,omitempty"`
+	UpdatedAt       time.Time          `json:"updated_at,omitempty" bson:"updated_at,omitempty"`
 }
 
 // AnalyticsData represents the structure for dashboard analytics
@@ -80,6 +114,11 @@ var (
 	smtpPort     string
 	smtpUser     string
 	smtpPassword string
+
+	cloudinaryCloudName string
+	cloudinaryAPIKey    string
+	cloudinaryAPISecret string
+	cld                 *cloudinary.Cloudinary
 )
 
 func loadTemplate(path string) (string, error) {
@@ -96,8 +135,14 @@ func main() {
 	// --- LOAD CONFIG ---
 	loadConfig()
 
-	// --- DATABASE CONNECTION ---
+	// Initialize Cloudinary
 	var err error
+	cld, err = cloudinary.NewFromParams(cloudinaryCloudName, cloudinaryAPIKey, cloudinaryAPISecret)
+	if err != nil {
+		log.Fatalf("Failed to initialize Cloudinary: %v", err)
+	}
+
+	// --- DATABASE CONNECTION ---
 	mongoURI := os.Getenv("MONGO_URI")
 	if mongoURI == "" {
 		mongoURI = "mongodb://localhost:27017"
@@ -128,6 +173,15 @@ func main() {
 		api.POST("/forgot-password", forgotPassword)
 		api.POST("/reset-password", resetPassword)
 
+		// --- USER PROFILE ROUTES ---
+		profile := api.Group("/profile")
+		profile.Use(AuthMiddleware())
+		{
+			profile.GET("/", getProfile)
+			profile.PUT("/", updateProfile)
+			profile.POST("/upload-picture", uploadProfilePicture)
+		}
+
 		// --- TODO ROUTES ---
 		todos := api.Group("/todos")
 		todos.Use(AuthMiddleware())
@@ -138,6 +192,18 @@ func main() {
 			todos.PUT("/:id", updateTodo)
 			todos.DELETE("/:id", deleteTodo)
 			todos.PUT("/:id/status", updateTodoStatus)
+		}
+
+		// --- LEARNING ROUTES ---
+		learnings := api.Group("/learnings")
+		learnings.Use(AuthMiddleware())
+		{
+			learnings.POST("/", createLearning)
+			learnings.GET("/", getLearnings)
+			learnings.GET("/:id", getLearning)
+			learnings.PUT("/:id", updateLearning)
+			learnings.DELETE("/:id", deleteLearning)
+			learnings.PUT("/:id/status", updateLearningStatus)
 		}
 
 		// --- DASHBOARD ROUTES ---
@@ -163,10 +229,15 @@ func main() {
 }
 
 func loadConfig() {
+	_ = godotenv.Load()
 	smtpHost = os.Getenv("SMTP_HOST")
 	smtpPort = os.Getenv("SMTP_PORT")
 	smtpUser = os.Getenv("SMTP_USER")
 	smtpPassword = os.Getenv("SMTP_PASSWORD")
+
+	cloudinaryCloudName = os.Getenv("CLOUDINARY_CLOUD_NAME")
+	cloudinaryAPIKey = os.Getenv("CLOUDINARY_API_KEY")
+	cloudinaryAPISecret = os.Getenv("CLOUDINARY_API_SECRET")
 }
 
 // --- MIDDLEWARE ---
@@ -215,6 +286,8 @@ func signup(c *gin.Context) {
 	}
 	user.Password = string(hashedPassword)
 	user.ID = primitive.NewObjectID()
+	user.CreatedAt = time.Now() // Add CreatedAt for user for consistency
+	user.UpdatedAt = time.Now() // Add UpdatedAt for user for consistency
 
 	_, err = collection.InsertOne(context.TODO(), user)
 	if err != nil {
@@ -361,6 +434,107 @@ func resetPassword(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Password has been reset successfully."})
+}
+
+// --- USER PROFILE HANDLERS ---
+func getProfile(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	objID := userID.(primitive.ObjectID)
+
+	collection := client.Database("todoapp").Collection("users")
+	var user User
+	err := collection.FindOne(context.TODO(), bson.M{"_id": objID}).Decode(&user)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User profile not found"})
+		return
+	}
+
+	user.Password = "" // Don't send password hash to frontend
+	c.JSON(http.StatusOK, user)
+}
+
+func updateProfile(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	objID := userID.(primitive.ObjectID)
+
+	var userUpdate User
+	if err := c.ShouldBindJSON(&userUpdate); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	collection := client.Database("todoapp").Collection("users")
+
+	// Only update allowed fields
+	updateFields := bson.M{
+		"first_name":          userUpdate.FirstName,
+		"last_name":           userUpdate.LastName,
+		"profile_picture_url": userUpdate.ProfilePictureURL,
+		"updated_at":          time.Now(),
+	}
+
+	update := bson.M{"$set": updateFields}
+	result, err := collection.UpdateOne(context.TODO(), bson.M{"_id": objID}, update)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update profile"})
+		return
+	}
+
+	if result.MatchedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Profile updated successfully"})
+}
+
+func uploadProfilePicture(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	objID := userID.(primitive.ObjectID)
+
+	file, err := c.FormFile("profile_picture")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded"})
+		return
+	}
+
+	src, err := file.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open file"})
+		return
+	}
+	defer func(src multipart.File) {
+		err := src.Close()
+		if err != nil {
+			log.Printf("Error closing file: %v", err)
+		}
+	}(src)
+
+	// Upload image to Cloudinary
+	uploadResult, err := cld.Upload.Upload(context.TODO(), src, uploader.UploadParams{
+		Folder:   "zyth-tasker/profile_pictures",
+		PublicID: objID.Hex(), // Use user ID as public ID for easy management
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to upload to Cloudinary: %v", err)})
+		return
+	}
+
+	// Update user's profile picture URL in MongoDB
+	collection := client.Database("todoapp").Collection("users")
+	update := bson.M{
+		"$set": bson.M{
+			"profile_picture_url": uploadResult.SecureURL,
+			"updated_at":          time.Now(),
+		},
+	}
+	_, err = collection.UpdateOne(context.TODO(), bson.M{"_id": objID}, update)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save profile picture URL"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Profile picture uploaded successfully", "url": uploadResult.SecureURL})
 }
 
 // --- TODO HANDLERS ---
@@ -669,6 +843,243 @@ func deleteTodo(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Todo deleted successfully"})
+}
+
+// --- LEARNING HANDLERS ---
+func createLearning(c *gin.Context) {
+	var learning Learning
+	if err := c.ShouldBindJSON(&learning); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	userID, _ := c.Get("user_id")
+	learning.UserID = userID.(primitive.ObjectID)
+	learning.ID = primitive.NewObjectID()
+	learning.CreatedAt = time.Now()
+	learning.UpdatedAt = time.Now()
+
+	if learning.Status == "" {
+		learning.Status = "Planned" // Default status for new learning
+	}
+
+	collection := client.Database("todoapp").Collection("learnings")
+	_, err := collection.InsertOne(context.TODO(), learning)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create learning entry"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, learning)
+}
+
+func getLearnings(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	filter := bson.M{"user_id": userID}
+
+	// Category Filter
+	categoryFilter := c.Query("category")
+	if categoryFilter != "" && categoryFilter != "all" {
+		filter["category"] = categoryFilter
+	}
+
+	// Status Filter
+	statusFilter := c.Query("status")
+	if statusFilter != "" && statusFilter != "all" {
+		filter["status"] = statusFilter
+	}
+
+	// Keyword Search
+	keyword := c.Query("keyword")
+	if keyword != "" {
+		filter["$or"] = []bson.M{
+			{"title": bson.M{"$regex": primitive.Regex{Pattern: keyword, Options: "i"}}},
+			{"notes": bson.M{"$regex": primitive.Regex{Pattern: keyword, Options: "i"}}},
+		}
+	}
+
+	collection := client.Database("todoapp").Collection("learnings")
+	cursor, err := collection.Find(context.TODO(), filter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve learning entries"})
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var learnings []Learning
+	if err = cursor.All(context.TODO(), &learnings); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decode learning entries"})
+		return
+	}
+	if learnings == nil {
+		learnings = []Learning{}
+	}
+
+	c.JSON(http.StatusOK, learnings)
+}
+
+func getLearning(c *gin.Context) {
+	id := c.Param("id")
+	objID, err := primitive.ObjectIDFromHex(id)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ID format"})
+		return
+	}
+	userID, _ := c.Get("user_id")
+
+	collection := client.Database("todoapp").Collection("learnings")
+	var learning Learning
+	err = collection.FindOne(context.TODO(), bson.M{"_id": objID, "user_id": userID}).Decode(&learning)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Learning entry not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, learning)
+}
+
+func updateLearning(c *gin.Context) {
+	id := c.Param("id")
+	objID, err := primitive.ObjectIDFromHex(id)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ID format"})
+		return
+	}
+	userID, _ := c.Get("user_id")
+
+	var learningUpdate Learning
+	if err := c.ShouldBindJSON(&learningUpdate); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	collection := client.Database("todoapp").Collection("learnings")
+	var existingLearning Learning
+	err = collection.FindOne(context.TODO(), bson.M{"_id": objID, "user_id": userID}).Decode(&existingLearning)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Learning entry not found"})
+		return
+	}
+
+	// Apply incoming updates to existing learning
+	existingLearning.Title = learningUpdate.Title
+	existingLearning.Category = learningUpdate.Category
+	existingLearning.Status = learningUpdate.Status
+	existingLearning.StartDate = learningUpdate.StartDate
+	existingLearning.CompletionDate = learningUpdate.CompletionDate
+	existingLearning.Resources = learningUpdate.Resources
+	existingLearning.Notes = learningUpdate.Notes
+	existingLearning.Progress = learningUpdate.Progress
+	existingLearning.Impact = learningUpdate.Impact
+	existingLearning.KeyMilestones = learningUpdate.KeyMilestones
+	existingLearning.ChallengesFaced = learningUpdate.ChallengesFaced
+	existingLearning.NextSteps = learningUpdate.NextSteps
+
+	existingLearning.UpdatedAt = time.Now()
+
+	update := bson.M{
+		"$set": existingLearning,
+	}
+
+	result, err := collection.UpdateOne(context.TODO(), bson.M{"_id": objID, "user_id": userID}, update)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update learning entry"})
+		return
+	}
+
+	if result.MatchedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Learning entry not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Learning entry updated successfully"})
+}
+
+func updateLearningStatus(c *gin.Context) {
+	id := c.Param("id")
+	objID, err := primitive.ObjectIDFromHex(id)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ID format"})
+		return
+	}
+	userID, _ := c.Get("user_id")
+
+	var payload struct {
+		Status string `json:"status"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload"})
+		return
+	}
+
+	collection := client.Database("todoapp").Collection("learnings")
+	var learning Learning
+	err = collection.FindOne(context.TODO(), bson.M{"_id": objID, "user_id": userID}).Decode(&learning)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Learning entry not found"})
+		return
+	}
+
+	learning.Status = payload.Status
+	learning.UpdatedAt = time.Now()
+
+	// If status is completed, set completion date and progress to 100
+	switch learning.Status {
+	case "Completed":
+		now := time.Now()
+		learning.CompletionDate = &now
+		learning.Progress = 100
+	case "Dropped":
+		// If dropped, clear completion date and set progress to 0
+		learning.CompletionDate = nil
+		learning.Progress = 0
+	}
+
+	update := bson.M{
+		"$set": bson.M{
+			"status":          learning.Status,
+			"updated_at":      learning.UpdatedAt,
+			"completion_date": learning.CompletionDate,
+			"progress":        learning.Progress,
+		},
+	}
+
+	result, err := collection.UpdateOne(context.TODO(), bson.M{"_id": objID, "user_id": userID}, update)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update learning status"})
+		return
+	}
+
+	if result.MatchedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Learning entry not found or not owned by user"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Learning status updated successfully"})
+}
+
+func deleteLearning(c *gin.Context) {
+	id := c.Param("id")
+	objID, err := primitive.ObjectIDFromHex(id)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ID format"})
+		return
+	}
+	userID, _ := c.Get("user_id")
+
+	collection := client.Database("todoapp").Collection("learnings")
+	result, err := collection.DeleteOne(context.TODO(), bson.M{"_id": objID, "user_id": userID})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete learning entry"})
+		return
+	}
+
+	if result.DeletedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Learning entry not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Learning entry deleted successfully"})
 }
 
 // --- DASHBOARD HANDLERS ---
